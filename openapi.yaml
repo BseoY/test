@@ -1,0 +1,427 @@
+openapi: 3.0.3
+info:
+  title: System Design Interview Tool API
+  version: 0.1.0
+  description: |
+    REST API for the v1 system-design interview tool. This file is the API contract:
+    any API change must update it.
+
+    ## Access model
+    There are no user accounts. Creating a session returns three unguessable links
+    (interviewer, candidate, observer). Each link embeds a bearer token for one role.
+    Clients send that token in the `X-Session-Token` header. The server derives the role
+    from the token and enforces it on every request. Interviewer-only operations return
+    403 for other roles. Tokens are secrets: never log them.
+
+    ## Session lifecycle
+    `created` -> `started` -> `ended` -> expired (default retention 30 days).
+    The candidate waits in a lobby while the session is `created`.
+
+    ## WebSocket sync endpoint (not modelled by OpenAPI)
+    `GET /ws/sessions/{session_id}?token=<session token>&name=<display name>` upgrades to a
+    WebSocket used for live board sync. Summary of the protocol (JSON text frames):
+
+    Client -> server:
+    - `board_update`: changed Excalidraw elements (merged by element `version`/`versionNonce`).
+      Dropped by the server for read-only connections (candidate set to read-only, observers).
+    - `cursor`: pointer position, relayed to other participants with the display name.
+    - `notes_update`: private interviewer notes. Accepted only from the interviewer connection.
+
+    Server -> client:
+    - `init`: full board state, session status, problem statement, candidate role, participants.
+      Private notes are included only for interviewer connections.
+    - `board_update`, `cursor`: relayed from other participants.
+    - `session_event`: lobby/started/ended, candidate role change, problem statement change,
+      participant joined/left, timer information.
+
+    Server rules: validate message schema, size-limit every frame and the element count,
+    never send private notes to non-interviewer connections, close with code 4401 for a bad
+    token and 4403 for a forbidden action.
+  license:
+    name: Proprietary
+servers:
+  - url: http://localhost:8000
+    description: Local development (v1 is local only)
+tags:
+  - name: sessions
+    description: Session lifecycle and configuration
+  - name: board
+    description: Board export
+security:
+  - sessionToken: []
+paths:
+  /api/sessions:
+    post:
+      tags: [sessions]
+      operationId: createSession
+      summary: Create a session
+      description: No authentication required. Returns the three role links.
+      security: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateSessionRequest'
+      responses:
+        '201':
+          description: Session created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateSessionResponse'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+  /api/sessions/{sessionId}:
+    parameters:
+      - $ref: '#/components/parameters/SessionId'
+    get:
+      tags: [sessions]
+      operationId: getSession
+      summary: Get a session
+      description: |
+        Any valid role token may read the session. The private `notes` field is returned
+        only to the interviewer.
+      responses:
+        '200':
+          description: Session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/sessions/{sessionId}/start:
+    parameters:
+      - $ref: '#/components/parameters/SessionId'
+    post:
+      tags: [sessions]
+      operationId: startSession
+      summary: Start a session
+      description: Interviewer only. Moves the session from `created` to `started` and admits the candidate from the lobby.
+      responses:
+        '200':
+          description: Session started
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /api/sessions/{sessionId}/end:
+    parameters:
+      - $ref: '#/components/parameters/SessionId'
+    post:
+      tags: [sessions]
+      operationId: endSession
+      summary: End a session
+      description: Interviewer only. Moves the session to `ended` and sets what the candidate sees afterwards.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EndSessionRequest'
+      responses:
+        '200':
+          description: Session ended
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+  /api/sessions/{sessionId}/candidate-role:
+    parameters:
+      - $ref: '#/components/parameters/SessionId'
+    put:
+      tags: [sessions]
+      operationId: setCandidateRole
+      summary: Set the candidate role
+      description: Interviewer only. Switches the candidate between edit and read-only. Enforced server-side on the WebSocket immediately.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetCandidateRoleRequest'
+      responses:
+        '200':
+          description: Role updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+  /api/sessions/{sessionId}/problem:
+    parameters:
+      - $ref: '#/components/parameters/SessionId'
+    put:
+      tags: [sessions]
+      operationId: setProblemStatement
+      summary: Set the problem statement
+      description: Interviewer only. Visible to all participants. Size-limited.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetProblemStatementRequest'
+      responses:
+        '200':
+          description: Problem statement updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+  /api/sessions/{sessionId}/export:
+    parameters:
+      - $ref: '#/components/parameters/SessionId'
+    get:
+      tags: [board]
+      operationId: exportBoard
+      summary: Export the board as JSON
+      description: |
+        Interviewer may always export. The candidate may export only when the session has
+        ended with `candidateEndScreen = read_only_board`. Observers may not export.
+        PNG export is produced client-side from the same data.
+      responses:
+        '200':
+          description: Board export in Excalidraw JSON format
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BoardExport'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+components:
+  securitySchemes:
+    sessionToken:
+      type: apiKey
+      in: header
+      name: X-Session-Token
+      description: |
+        Bearer-style secret taken from the interviewer, candidate, or observer link. The server
+        maps it to exactly one role for exactly one session. Treat as a secret: generate with a
+        CSPRNG (at least 128 bits), never log, never include in error bodies, serve only over
+        HTTPS when deployed beyond local use.
+  parameters:
+    SessionId:
+      name: sessionId
+      in: path
+      required: true
+      description: Public session identifier (not a secret; access needs a token).
+      schema:
+        type: string
+  responses:
+    Unauthorized:
+      description: Missing or invalid session token
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Forbidden:
+      description: The token's role is not allowed to perform this action
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: Session not found or expired
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Conflict:
+      description: Action not valid in the current session status
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    PayloadTooLarge:
+      description: Request body exceeds the size limit
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    ValidationError:
+      description: Request body failed validation
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+  schemas:
+    Role:
+      type: string
+      enum: [interviewer, candidate, observer]
+    CandidateRole:
+      type: string
+      enum: [edit, read_only]
+    SessionStatus:
+      type: string
+      enum: [created, started, ended]
+    CandidateEndScreen:
+      type: string
+      enum: [ended_screen, read_only_board]
+      default: read_only_board
+      description: What the candidate sees after the session ends.
+    CreateSessionRequest:
+      type: object
+      properties:
+        title:
+          type: string
+          maxLength: 200
+        timerSeconds:
+          type: integer
+          minimum: 60
+          maximum: 14400
+          description: Optional countdown duration.
+        defaultCandidateRole:
+          $ref: '#/components/schemas/CandidateRole'
+    SessionLinks:
+      type: object
+      required: [interviewer, candidate, observer]
+      properties:
+        interviewer:
+          type: string
+          format: uri
+        candidate:
+          type: string
+          format: uri
+        observer:
+          type: string
+          format: uri
+    CreateSessionResponse:
+      type: object
+      required: [sessionId, links]
+      properties:
+        sessionId:
+          type: string
+        links:
+          $ref: '#/components/schemas/SessionLinks'
+    Session:
+      type: object
+      required: [id, status, candidateRole, createdAt, expiresAt]
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+          nullable: true
+        status:
+          $ref: '#/components/schemas/SessionStatus'
+        candidateRole:
+          $ref: '#/components/schemas/CandidateRole'
+        candidateEndScreen:
+          allOf:
+            - $ref: '#/components/schemas/CandidateEndScreen'
+          nullable: true
+          description: Set once the session has ended.
+        problemStatement:
+          type: string
+          nullable: true
+        timerSeconds:
+          type: integer
+          nullable: true
+        startedAt:
+          type: string
+          format: date-time
+          nullable: true
+        endedAt:
+          type: string
+          format: date-time
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+        expiresAt:
+          type: string
+          format: date-time
+        yourRole:
+          $ref: '#/components/schemas/Role'
+        notes:
+          type: string
+          nullable: true
+          description: Private interviewer notes. Present only when the caller is the interviewer.
+    EndSessionRequest:
+      type: object
+      properties:
+        candidateEndScreen:
+          $ref: '#/components/schemas/CandidateEndScreen'
+    SetCandidateRoleRequest:
+      type: object
+      required: [role]
+      properties:
+        role:
+          $ref: '#/components/schemas/CandidateRole'
+    SetProblemStatementRequest:
+      type: object
+      required: [problemStatement]
+      properties:
+        problemStatement:
+          type: string
+          maxLength: 10000
+    BoardExport:
+      type: object
+      description: Excalidraw scene JSON.
+      required: [type, version, elements]
+      properties:
+        type:
+          type: string
+          example: excalidraw
+        version:
+          type: integer
+        source:
+          type: string
+        elements:
+          type: array
+          maxItems: 5000
+          items:
+            type: object
+            additionalProperties: true
+        appState:
+          type: object
+          additionalProperties: true
+    Error:
+      type: object
+      required: [detail]
+      properties:
+        detail:
+          type: string
